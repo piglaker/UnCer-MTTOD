@@ -22,4 +22,4 @@
 *.md
 *.zip
 .data.zip
-.gitignores
+.gitignore
