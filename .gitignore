@@ -21,3 +21,4 @@ __pycache__/*
 *.log
 *.md
 *.zip
+.data.zip
