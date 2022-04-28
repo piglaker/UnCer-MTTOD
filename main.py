@@ -17,7 +17,7 @@
    See the License for the specific language governing permissions and
    limitations under the License.
 """
-
+import os
 import random
 
 import torch
@@ -31,18 +31,40 @@ from utils.io_utils import get_or_create_logger
 logger = get_or_create_logger(__name__)
 
 
+import random
+
+import torch
+import numpy as np
+
+from config import get_config
+from runner import MultiWOZRunner
+
+from utils.io_utils import get_or_create_logger
+
+
 def main():
     """ main function """
     cfg = get_config()
 
-    # cuda setup
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    num_gpus = min(torch.cuda.device_count(), cfg.num_gpus)
+    cuda_available = torch.cuda.is_available()
 
+    if cuda_available:
+        if cfg.num_gpus > 1:
+            logger.info('Using Multi-GPU training, number of GPU is {}'.format(cfg.num_gpus))
+            torch.cuda.set_device(cfg.local_rank)
+            device = torch.device('cuda', cfg.local_rank)
+            torch.distributed.init_process_group(backend='nccl')
+        else:
+            logger.info('Using single GPU training.')
+            device = torch.device('cuda')
+    else:
+        device = torch.device('cpu')
+
+        num_gpus = min(torch.cuda.device_count(), cfg.num_gpus)
+    
     setattr(cfg, "device", device)
-    setattr(cfg, "num_gpus", num_gpus)
 
-    logger.info("Device: %s (the number of GPUs: %d)", str(device), num_gpus)
+    logger.info("Device: %s (the number of GPUs: %d)", str(device), cfg.num_gpus)
 
     if cfg.seed > 0:
         random.seed(cfg.seed)
@@ -52,11 +74,17 @@ def main():
 
         logger.info("Set random seed to %d", cfg.seed)
 
+
+    cfg.learning_rate = 5e-4 * cfg.batch_size_per_gpu * cfg.num_gpus / 8
+
+    #print(cfg)
+
     runner = MultiWOZRunner(cfg)
 
     if cfg.run_type == "train":
         runner.train()
     else:
+        print("Skip_When_Predict: ", cfg.skip_when_predict)
         runner.predict()
 
 

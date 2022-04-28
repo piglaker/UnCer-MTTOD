@@ -60,7 +60,7 @@ class Preprocessor(object):
             self.do_tokenize_text = True
 
         self.mapping_pair = self.load_mapping_pair()
-
+    
         self.get_db_values()
 
         self.preprocess_db()

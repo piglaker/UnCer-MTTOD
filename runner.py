@@ -31,10 +31,17 @@ from collections import OrderedDict, defaultdict
 
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import DataLoader, sampler
+from torch.utils.data.distributed import DistributedSampler
 from transformers import AdamW, get_linear_schedule_with_warmup, get_constant_schedule
 from transformers.modeling_outputs import BaseModelOutput
 from tensorboardX import SummaryWriter
+
+from model import T5WithSpan, T5WithTokenSpan
+from reader import MultiWOZIterator, MultiWOZReader, MultiWOZDataset, SequentialDistributedSampler, CollatorTrain
+from evaluator import MultiWozEvaluator
 
 from model import T5WithSpan, T5WithTokenSpan
 from reader import MultiWOZIterator, MultiWOZReader
@@ -42,6 +49,7 @@ from evaluator import MultiWozEvaluator
 
 from utils import definitions
 from utils.io_utils import get_or_create_logger, load_json, save_json
+from utils.ddp_utils import reduce_mean, reduce_sum
 
 
 logger = get_or_create_logger(__name__)
@@ -174,6 +182,10 @@ class BaseRunner(metaclass=ABCMeta):
     def __init__(self, cfg, reader):
         self.cfg = cfg
         self.reader = reader
+        self.template4resp = ["<bos_resp> sorry, could you please repeat that",\
+            "<bos_resp> excuse me, could you tell me",\
+                "<bos_resp> i am sorry i do not understand what you just said. please repeat the",\
+                    "<bos_resp> oh, i am sorry about that. excuse me. what"]
 
         self.model = self.load_model()
 
@@ -203,26 +215,34 @@ class BaseRunner(metaclass=ABCMeta):
 
         if initialize_additional_decoder:
             model.initialize_additional_decoder()
-        '''
+        
+        model.to(self.cfg.device)
+
         if self.cfg.num_gpus > 1:
-            model = torch.nn.DataParallel(model)
-        '''
+            model = nn.parallel.DistributedDataParallel(model, device_ids=[self.cfg.local_rank], output_device=self.cfg.local_rank)
+        
         model.to(self.cfg.device)
 
         return model
 
     def save_model(self, epoch):
+        #if not os.path.exists(os.path.join(self.cfg.model_dir, "run_config.json")):
+        #    save_json(self.cfg, os.path.join(self.cfg.model_dir, "run_config.json"))
+
         latest_ckpt = "ckpt-epoch{}".format(epoch)
         save_path = os.path.join(self.cfg.model_dir, latest_ckpt)
-        '''
+        
         if self.cfg.num_gpus > 1:
             model = self.model.module
         else:
             model = self.model
-        '''
-        model = self.model
+        
+        #model = self.model
 
         model.save_pretrained(save_path)
+
+        if self.cfg.save_best_model:
+            self.cfg.max_to_keep_ckpt = 1
 
         # keep chekpoint up to maximum
         checkpoints = sorted(
@@ -254,7 +274,7 @@ class BaseRunner(metaclass=ABCMeta):
         logger.info("Total training steps = {}, warmup steps = {}".format(
             num_train_steps, num_warmup_steps))
 
-        optimizer = AdamW(self.model.parameters(), lr=self.cfg.learning_rate)
+        optimizer = AdamW(self.model.parameters(), lr=self.cfg.learning_rate, weight_decay=self.cfg.weight_decay)
 
         if self.cfg.no_learning_rate_decay:
             scheduler = get_constant_schedule(optimizer)
@@ -294,13 +314,65 @@ class BaseRunner(metaclass=ABCMeta):
 
 class MultiWOZRunner(BaseRunner):
     def __init__(self, cfg):
-        reader = MultiWOZReader(cfg.backbone, cfg.version)
+        
+        reader = MultiWOZReader(cfg.backbone, cfg.version, cfg.subversion)
+
+        self.subversion = cfg.subversion
 
         self.iterator = MultiWOZIterator(reader)
 
         super(MultiWOZRunner, self).__init__(cfg, reader)
+        self.loss_container = []
+
+        self.uncertain_rhetorical_question_success = 0
+        self.uncertain_rhetorical_question_attempt = 0
+        self.uncertain_rhetorical_question_fault = 0
+        self.uncertain_rhetorical_question_total = 0
+
+        self.rhetorical_question_success = 0
+        self.rhetorical_question_attempt = 0
+        self.rhetorical_question_fault = 0
+        self.rhetorical_question_success_tolerate = 0
+        self.rhetorical_question_total = 0
+
+    def pretty_show(self, *anything):
+
+
+        def speak(something):
+
+            if isinstance(something, str):
+                self.pre_print(something)
+                return
+
+            if isinstance(something, torch.Tensor):
+                something = something.tolist()
+                for i in something:
+                    self.pre_print(self.reader.tokenizer.decode(i))    
+                    return
+
+            for k,v in something.items():
+                
+                if k not in ['dial_id', 'turn_num', 'turn_domain', 'pointer', 'span', 'resp_span', 'user_span']:
+                    try:
+                        self.pre_print(k, self.reader.tokenizer.decode(v))
+                    except:
+                        self.pre_print(k, v)
+                        self.pre_print("ERROR")
+                        exit()
+                else:
+                    self.pre_print(k, v)
+
+
+        for something in anything:
+            speak(something)
+
 
     def step_fn(self, inputs, span_labels, belief_labels, resp_labels):
+        
+        def quick_show(inputs):
+            for input in inputs:
+                self.pre_print(self.reader.tokenizer.decode(input))
+
         inputs = inputs.to(self.cfg.device)
         span_labels = span_labels.to(self.cfg.device)
         belief_labels = belief_labels.to(self.cfg.device)
@@ -322,6 +394,8 @@ class MultiWOZRunner(BaseRunner):
         span_loss = belief_outputs[2]
         span_pred = belief_outputs[3]
 
+        self.loss_container.append(belief_loss.item())
+        
         if self.cfg.task == "e2e":
             last_hidden_state = belief_outputs[5]
 
@@ -388,7 +462,143 @@ class MultiWOZRunner(BaseRunner):
 
         return loss, step_outputs
 
-    def train_epoch(self, train_iterator, optimizer, scheduler, reporter=None):
+    def reduce_ddp_stepoutpus(self, step_outputs):
+        step_outputs_all = {"belief": {"loss": reduce_mean(step_outputs['belief']['loss']),
+                            "correct": reduce_sum(step_outputs['belief']['correct']),
+                            "count": reduce_sum(step_outputs['belief']['count'])}}
+
+        if self.cfg.add_auxiliary_task:
+            step_outputs_all['span'] = {
+                'loss': reduce_mean(step_outputs['span']['loss']),
+                "correct": reduce_sum(step_outputs['span']['correct']),
+                "count": reduce_sum(step_outputs['span']['count'])
+            }
+
+        if self.cfg.task == "e2e":
+            step_outputs_all["resp"] = {
+                'loss': reduce_mean(step_outputs['resp']['loss']),
+                "correct": reduce_sum(step_outputs['resp']['correct']),
+                "count": reduce_sum(step_outputs['resp']['count'])
+            }
+
+        return step_outputs_all
+
+    def train_epoch(self, data_loader, optimizer, scheduler, reporter=None):
+        self.model.train()
+        self.model.zero_grad()
+        epoch_step, train_loss = 0, 0.
+        for batch in iter(data_loader):
+            start_time = time.time()
+
+            inputs, span_labels, belief_labels, resp_labels = batch
+
+            loss, step_outputs = self.step_fn(inputs, span_labels, belief_labels, resp_labels)
+
+            if self.cfg.grad_accum_steps > 1:
+                loss = loss / self.cfg.grad_accum_steps
+
+            loss.backward()
+            train_loss += loss.item()
+
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.cfg.max_grad_norm)
+
+            if (epoch_step + 1) % self.cfg.grad_accum_steps == 0:
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+
+                lr = scheduler.get_last_lr()[0]
+
+                if reporter is not None:
+                    reporter.step(start_time, lr, step_outputs)
+            
+            epoch_step += 1
+        
+        return train_loss
+
+    def train(self):
+        train_dataset = MultiWOZDataset(self.reader, 'train', self.cfg.task, self.cfg.ururu, context_size=self.cfg.context_size, num_dialogs=self.cfg.num_train_dialogs, excluded_domains=self.cfg.excluded_domains)
+        
+        if self.cfg.num_gpus > 1:
+            train_sampler = DistributedSampler(train_dataset)
+        else:
+            train_sampler = sampler(train_dataset)
+        
+        train_collator = CollatorTrain(self.reader.pad_token_id, self.reader.tokenizer)
+        train_dataloader = DataLoader(train_dataset, sampler=train_sampler, batch_size=self.cfg.batch_size_per_gpu, collate_fn=train_collator)
+
+        num_training_steps_per_epoch = len(train_dataloader) // self.cfg.grad_accum_steps
+
+        optimizer, scheduler = self.get_optimizer_and_scheduler(
+            num_training_steps_per_epoch, self.cfg.batch_size_per_gpu)
+
+        if self.cfg.local_rank in [0, -1]:
+            reporter = Reporter(num_training_steps_per_epoch, self.cfg.model_dir)
+        else:
+            reporter = None
+
+        max_score = 0.0
+        for epoch in range(1, self.cfg.epochs + 1):
+            train_dataloader.sampler.set_epoch(epoch)
+
+            train_loss = self.train_epoch(train_dataloader, optimizer, scheduler, reporter)
+
+            if self.cfg.num_gpus > 1:
+                torch.distributed.barrier()
+                
+            logger.info("done {}/{} epoch, train loss is:{:f}".format(epoch, self.cfg.epochs, train_loss))
+
+            # if not self.cfg.no_validation:
+            #     self.validation(reporter.global_step)
+
+            if epoch < 5: # Evaluating after training 5 epochs
+                continue
+
+            if self.cfg.save_best_model:
+                current_score = self.predict()
+                if max_score < current_score:
+                    max_score = current_score
+                    if self.cfg.local_rank in [0, -1]:
+                        self.save_model(epoch)
+            else:
+                if self.cfg.local_rank in [0, -1]:
+                    self.save_model(epoch)
+
+            if self.cfg.num_gpus > 1:
+                torch.distributed.barrier()
+
+    def validation(self, global_step):
+        self.model.eval()
+
+        eval_dataset = MultiWOZDataset(self.reader, 'dev', self.cfg.task, self.cfg.ururu, context_size=self.cfg.context_size, excluded_domains=self.cfg.excluded_domains)
+        eval_sampler = SequentialDistributedSampler(eval_dataset, self.cfg.batch_size_per_gpu_eval)
+        eval_collator = CollatorTrain(self.reader.pad_token_id)
+        eval_dataloader = DataLoader(eval_dataset, sampler=eval_sampler, batch_size=self.cfg.batch_size_per_gpu_eval, collate_fn=eval_collator)
+
+        reporter = Reporter(1000000, self.cfg.model_dir)
+
+        with torch.no_grad():
+            for batch in tqdm(eval_dataloader, desc="Validaction"):
+                start_time = time.time()
+
+                inputs, labels = batch
+
+                _, step_outputs = self.step_fn(inputs, *labels)
+
+                torch.distributed.barrier()
+
+                step_outputs_all = self.reduce_ddp_stepoutpus(step_outputs)
+
+                if self.cfg.local_rank == 0:
+                    reporter.step(start_time, lr=None, step_outputs=step_outputs_all, is_train=False)
+
+            do_span_stats = True if "span" in step_outputs else False
+            do_resp_stats = True if "resp" in step_outputs else False
+
+            reporter.info_stats("dev", global_step, do_span_stats, do_resp_stats)
+
+    def _train_epoch(self, train_iterator, optimizer, scheduler, reporter=None):
         self.model.train()
         self.model.zero_grad()
 
@@ -399,6 +609,7 @@ class MultiWOZRunner(BaseRunner):
 
             _, belief_labels, _ = labels
 
+        
             loss, step_outputs = self.step_fn(inputs, *labels)
 
             if self.cfg.grad_accum_steps > 1:
@@ -419,7 +630,7 @@ class MultiWOZRunner(BaseRunner):
                 if reporter is not None:
                     reporter.step(start_time, lr, step_outputs)
 
-    def train(self):
+    def _train(self):
         train_batches, num_training_steps_per_epoch, _, _ = self.iterator.get_batches(
             "train", self.cfg.batch_size, self.cfg.num_gpus, shuffle=True,
             num_dialogs=self.cfg.num_train_dialogs, excluded_domains=self.cfg.excluded_domains)
@@ -442,7 +653,9 @@ class MultiWOZRunner(BaseRunner):
             if not self.cfg.no_validation:
                 self.validation(reporter.global_step)
 
-    def validation(self, global_step):
+        #self.pre_print(self.loss_container, sum(self.loss_container) / len(self.loss_container))
+
+    def _validation(self, global_step):
         self.model.eval()
 
         dev_batches, num_steps, _, _ = self.iterator.get_batches(
@@ -494,8 +707,8 @@ class MultiWOZRunner(BaseRunner):
                 span_output = span_outputs[i]
                 input_id = input_ids[i]
 
-                #print(self.reader.tokenizer.decode(input_id))
-                #print(self.reader.tokenizer.decode(bspn))
+                #self.pre_print(self.reader.tokenizer.decode(input_id))
+                #self.pre_print(self.reader.tokenizer.decode(bspn))
 
                 eos_idx = input_id.index(self.reader.eos_token_id)
                 input_id = input_id[:eos_idx]
@@ -575,7 +788,7 @@ class MultiWOZRunner(BaseRunner):
                         del span_dict[domain]
                         flatten_span.pop()
 
-                #print(flatten_span)
+                #self.pre_print(flatten_span)
 
                 #input()
 
@@ -666,11 +879,62 @@ class MultiWOZRunner(BaseRunner):
 
         return batch_decoded
 
+    def bspn2oral(self, bspn):
+        return self.reader.bspn_to_constraint_dict(self.reader.tokenizer.decode(bspn, clean_up_tokenization_spaces=False))
+
+    def oral_equal(self, orderd_dict1, orderd_dict2):
+        if orderd_dict1.keys() != orderd_dict2.keys():
+            return False
+        
+        # for k, v in orderd_dict1.keys():
+            
+        return True
+
+    def is_extra_info(self, turn):
+        if not isinstance(turn['user'], str):
+            resp = self.reader.tokenizer.decode(turn['user'])
+        
+        info_template = "<bos_user> XXXX is XXXX. <eos_user>"
+
+        import re
+        
+        def is_info(user, template):
+            #self.pre_print(user)
+            user_ = user.split()
+            template_ = template.split()
+
+            # self.pre_print(user_)
+            # self.pre_print(template_)
+
+            # self.pre_print("is_info")
+
+            if len(user_) != len(template_):
+                return False
+            
+            for t, tok in enumerate(template_):
+                if re.sub("\.", "", tok) != "XXXX":
+                    if user_[t] != tok:
+                        self.pre_print("unmatch")
+                        self.pre_print(tok, user_[t])
+                        return False
+            # self.pre_print("is!")
+            return True
+
+        return is_info(resp, info_template)
+
     def predict(self):
+        self.pre_print(self.reader.tokenizer.get_added_vocab())
+        #exit()
         self.model.eval()
+        self.pre_print(self.cfg.batch_size_per_gpu_eval)
+
+        if self.cfg.num_gpus > 1:
+            model = self.model.module
+        else:
+            model = self.model
 
         pred_batches, _, _, _ = self.iterator.get_batches(
-            self.cfg.pred_data_type, self.cfg.batch_size,
+            self.cfg.pred_data_type, self.cfg.batch_size_per_gpu_eval,
             self.cfg.num_gpus, excluded_domains=self.cfg.excluded_domains)
 
         early_stopping = True if self.cfg.beam_size > 1 else False
@@ -686,17 +950,42 @@ class MultiWOZRunner(BaseRunner):
                     eval_dial_list.extend(dial_ids)
 
         results = {}
-        for dial_batch in tqdm(pred_batches, total=len(pred_batches), desc="Prediction"):
+
+        turn_level_acc = 0
+        turn_level_total = 0
+
+        tuple_level_acc = 0
+        tuple_level_total = 0
+
+        toy_car = 0
+
+        for dial_batch in tqdm(pred_batches[::-1], total=len(pred_batches), desc="Prediction"):
+            #self.pre_print(dial_batch[0])
+            #exit(0)
             batch_size = len(dial_batch)
+            toy_car += 1
+            #self.pre_print("batch_size: ", batch_size, self.cfg.batch_size_per_gpu_eval)
+            need_skip_tags = [0] * batch_size #
 
             dial_history = [[] for _ in range(batch_size)]
             domain_history = [[] for _ in range(batch_size)]
             constraint_dicts = [OrderedDict() for _ in range(batch_size)]
             for turn_batch in self.iterator.transpose_batch(dial_batch):
+                #self.pre_print(len(turn_batch))
+                from copy import deepcopy
+                turn_batch_back = deepcopy(turn_batch)
+
+                # for turn in turn_batch:
+                    # self.pretty_show(turn)
+                # self.pre_print("-----")
                 batch_encoder_input_ids = []
+                attention_mask = []
+
                 for t, turn in enumerate(turn_batch):
+                    # self.pretty_show(turn)
+                    
                     context, _ = self.iterator.flatten_dial_history(
-                        dial_history[t], [], len(turn["user"]), self.cfg.context_size)
+                        dial_history[t], [], turn["user"], self.cfg.context_size)
 
                     encoder_input_ids = context + turn["user"] + [self.reader.eos_token_id]
 
@@ -718,9 +1007,23 @@ class MultiWOZRunner(BaseRunner):
                 attention_mask = torch.where(
                     batch_encoder_input_ids == self.reader.pad_token_id, 0, 1)
 
+                if self.cfg.skip_when_predict:
+                    for t, turn in enumerate(turn_batch):
+                        if need_skip_tags[t] == 1:
+                            # self.pre_print("need skip")
+                            if self.is_extra_info(turn):
+                                skip_attention_mask = torch.tensor([1] * len(batch_encoder_input_ids[0])).to(self.cfg.device)
+                                attention_mask[t] = skip_attention_mask
+                                # self.pre_print("just mask")
+                                
+                            else:
+                                # self.pre_print("skip over!")
+                                need_skip_tags[t] = 0
+
                 # belief tracking
                 with torch.no_grad():
-                    encoder_outputs = self.model(input_ids=batch_encoder_input_ids,
+                    self.pretty_show("__in__", batch_encoder_input_ids)
+                    encoder_outputs = model(input_ids=batch_encoder_input_ids,
                                                  attention_mask=attention_mask,
                                                  return_dict=False,
                                                  encoder_only=True,
@@ -736,8 +1039,8 @@ class MultiWOZRunner(BaseRunner):
                     # wrap up encoder outputs
                     encoder_outputs = BaseModelOutput(
                         last_hidden_state=last_hidden_state)
-
-                    belief_outputs = self.model.generate(encoder_outputs=encoder_outputs,
+                    
+                    belief_outputs = model.generate(encoder_outputs=encoder_outputs,
                                                          attention_mask=attention_mask,
                                                          eos_token_id=self.reader.eos_token_id,
                                                          max_length=200,
@@ -758,19 +1061,15 @@ class MultiWOZRunner(BaseRunner):
                 else:
                     pred_spans = None
                     input_ids = None
-
+                
+                # for outputs in belief_outputs:
+                    # self.pre_print("***", self.reader.tokenizer.decode(outputs))
+                
                 decoded_belief_outputs = self.finalize_bspn(
                     belief_outputs, domain_history, constraint_dicts, pred_spans, input_ids)
 
                 for t, turn in enumerate(turn_batch):
                     turn.update(**decoded_belief_outputs[t])
-                    '''
-                    print(self.reader.tokenizer.decode(input_ids[t]))
-                    print(self.reader.tokenizer.decode(turn["bspn_gen"]))
-                    print(turn["span"])
-                    print(self.reader.tokenizer.decode(turn["bspn_gen_with_span"]))
-                    input()
-                    '''
 
                 if self.cfg.task == "e2e":
                     dbpn = []
@@ -787,7 +1086,7 @@ class MultiWOZRunner(BaseRunner):
 
                             bspn_gen = self.reader.tokenizer.decode(
                                 bspn_gen, clean_up_tokenization_spaces=False)
-
+                            #self.pre_print("**", bspn_gen)
                             db_token = self.reader.bspn_to_db_pointer(bspn_gen,
                                                                       turn["turn_domain"])
 
@@ -807,8 +1106,6 @@ class MultiWOZRunner(BaseRunner):
                         # T5 use pad_token as start_decoder_token_id
                         dbpn[t] = [self.reader.pad_token_id] + db
 
-                    #print(dbpn)
-
                     # aspn has different length
                     if self.cfg.use_true_curr_aspn:
                         for t, _dbpn in enumerate(dbpn):
@@ -820,7 +1117,8 @@ class MultiWOZRunner(BaseRunner):
                                 last_hidden_state=last_hidden_state[t].unsqueeze(0))
 
                             with torch.no_grad():
-                                resp_outputs = self.model.generate(
+                                self.pretty_show("__in__", resp_decoder_input_ids)
+                                resp_outputs = model.generate(
                                     encoder_outputs=encoder_outputs,
                                     attention_mask=attention_mask[t].unsqueeze(0),
                                     decoder_input_ids=resp_decoder_input_ids,
@@ -839,7 +1137,6 @@ class MultiWOZRunner(BaseRunner):
                                 decoded_resp_outputs = self.finalize_resp(resp_outputs)
 
                                 turn_batch[t].update(**decoded_resp_outputs[0])
-
                     else:
                         resp_decoder_input_ids = self.iterator.tensorize(dbpn)
 
@@ -847,7 +1144,8 @@ class MultiWOZRunner(BaseRunner):
 
                         # response generation
                         with torch.no_grad():
-                            resp_outputs = self.model.generate(
+                            self.pretty_show("__in__, no true",resp_decoder_input_ids)
+                            resp_outputs = model.generate(
                                 encoder_outputs=encoder_outputs,
                                 attention_mask=attention_mask,
                                 decoder_input_ids=resp_decoder_input_ids,
@@ -865,9 +1163,26 @@ class MultiWOZRunner(BaseRunner):
 
                         decoded_resp_outputs = self.finalize_resp(resp_outputs)
 
+                        for turn in turn_batch:
+                            self.pretty_show(turn)
+                            self.pre_print("before")
+
                         for t, turn in enumerate(turn_batch):
                             turn.update(**decoded_resp_outputs[t])
+                            self.check_update(turn_batch_back[t], turn) 
+                            #need_skip = self.catch(turn)
+                            need_skip = self.catch_bspn(turn["bspn"], turn["bspn_gen"])
+                            self.catch(turn)
+                            #if need_skip:
+                            #    need_skip_tags[t] = 1
 
+
+                        for turn in turn_batch:
+                             self.pretty_show(turn)
+                             self.pre_print("after")
+
+                        self.pre_print('$'*10)
+                        
                 # update dial_history
                 for t, turn in enumerate(turn_batch):
                     pv_text = copy.copy(turn["user"])
@@ -905,13 +1220,62 @@ class MultiWOZRunner(BaseRunner):
 
                     dial_history[t].append(pv_text)
 
+            #if toy_car == 10:
+            #    exit()
+
             result = self.iterator.get_readable_batch(dial_batch)
             results.update(**result)
+
+        #self.pre_print("turn_level_acc: ", turn_level_acc / turn_level_total)
+
+        # self.pre_print("%"*10)
+
+        self.turn_level_uncertain_active_question_precison = self.uncertain_rhetorical_question_success / (self.uncertain_rhetorical_question_attempt+1e-10)
+        self.turn_level_uncertain_active_question_recall = self.uncertain_rhetorical_question_success / (self.uncertain_rhetorical_question_total + 1e-10)
+        self.turn_level_uncertain_active_question_f1_score = 2 * self.turn_level_uncertain_active_question_precison * self.turn_level_uncertain_active_question_recall / \
+            (self.turn_level_uncertain_active_question_precison + self.turn_level_uncertain_active_question_recall + 1e-10) 
+
+        self.pre_print("attempt (uncertain): ", self.uncertain_rhetorical_question_attempt)
+        self.pre_print("fault (uncertain): ", self.uncertain_rhetorical_question_fault)
+        self.pre_print("success (uncertain): ", self.uncertain_rhetorical_question_success)
+        self.pre_print("total (uncertain): ", self.uncertain_rhetorical_question_total)
+
+        self.pre_print("turn_level_uncertain_active_question_acc (uncertain): ", self.turn_level_uncertain_active_question_precison )
+        self.pre_print("turn_level_uncertain_active_question_recall (uncertain): ", self.turn_level_uncertain_active_question_recall )
+        self.pre_print("turn_level_uncertain_active_question_f1_score (uncertain): ", self.turn_level_uncertain_active_question_f1_score)
+
+        self.pre_print("%"*10)
+
+        self.turn_level_active_question_precison_tolerate = self.rhetorical_question_success_tolerate / (self.rhetorical_question_attempt+1e-10)
+        self.turn_level_active_question_recall_tolerate = self.rhetorical_question_success_tolerate / (self.rhetorical_question_total + 1e-10)
+        self.turn_level_active_question_f1_score_tolerate = 2 * self.turn_level_active_question_precison_tolerate * self.turn_level_active_question_recall_tolerate / \
+            (self.turn_level_active_question_precison_tolerate + self.turn_level_active_question_recall_tolerate + 1e-10)
+        
+        self.pre_print("attempt (template): ", self.rhetorical_question_attempt)
+        self.pre_print("fault (template): ", self.rhetorical_question_fault)
+        self.pre_print("success (template): ", self.rhetorical_question_success)
+        self.pre_print("success_tolerate (template): ", self.rhetorical_question_success_tolerate)
+        self.pre_print("total (template): ", self.rhetorical_question_total)
+
+        self.pre_print("turn_level_active_question_acc_tolerate (template): ", self.turn_level_active_question_precison_tolerate )
+        self.pre_print("turn_level_active_question_recall_tolerate (template): ", self.turn_level_active_question_recall_tolerate)
+        self.pre_print("turn_level_active_question_f1_score_tolerate (template): ", self.turn_level_active_question_f1_score_tolerate)
+
+        self.turn_level_active_question_precison = self.rhetorical_question_success / (self.rhetorical_question_attempt+1e-10)
+        self.turn_level_active_question_recall = self.rhetorical_question_success / (self.rhetorical_question_total + 1e-10)
+        self.turn_level_active_question_f1_score = 2 * self.turn_level_active_question_precison * self.turn_level_active_question_recall / \
+            (self.turn_level_active_question_precison + self.turn_level_active_question_recall + 1e-10)
+
+        self.pre_print("turn_level_active_question_acc: ", self.turn_level_active_question_precison )
+        self.pre_print("turn_level_active_question_recall: ", self.turn_level_active_question_recall )
+        self.pre_print("turn_level_active_question_f1_score: ", self.turn_level_active_question_f1_score)
+
+        # self.pre_print("%"*10)
 
         if self.cfg.output:
             save_json(results, os.path.join(self.cfg.ckpt, self.cfg.output))
 
-        evaluator = MultiWozEvaluator(self.reader, self.cfg.pred_data_type)
+        evaluator = MultiWozEvaluator(self.reader, self.cfg.pred_data_type, self.subversion)
 
         if self.cfg.task == "e2e":
             bleu, success, match = evaluator.e2e_eval(
@@ -934,3 +1298,117 @@ class MultiWOZRunner(BaseRunner):
                 acc = (correct / count) * 100
 
                 logger.info('{0} acc: {1:.2f}'.format(domain_slot, acc))
+    
+        return score
+
+    def check_update(self, turn_back, turn):
+        for k,v in turn_back.items():
+            if v != turn[k]:
+                self.pre_print('%'*10)
+                self.pre_print("update:")
+                self.pre_print(self.reader.tokenizer.decode(v))
+                self.pre_print(self.reader.tokenizer.decode(turn[k]))
+                self.pre_print('%'*10)
+
+    def get_key_value(self, template, resp):
+        # matched already
+        import re
+        import string
+        re_match = re.match(template, resp)
+        # <_sre.SRE_Match object; span=(0, 3), match='sss'>
+        cut = resp[re_match.span()[-1]:] # "sssss XXXXX sdadsadda"
+        key_value = re.sub('[{}]'.format(string.punctuation), "", cut.split()[0])
+        # self.pre_print(key_value) 
+        return key_value
+
+    def extract(self, bspn):
+        tmp = bspn.split()
+        return  "true" == tmp[3] if len(tmp) > 4 else False
+
+    def catch_bspn(self, bspn, bspn_gen):
+        """
+        """
+        self.pre_print("***** uncertain catcher *****")
+        if not isinstance(bspn, str):
+            bspn = self.reader.tokenizer.decode(bspn)
+        if not isinstance(bspn_gen, str):
+            bspn_gen = self.reader.tokenizer.decode(bspn_gen)
+        
+        #uncertainty_token_true = "<bos_belief> [uncertain] [value_bool] true"
+        #uncertainty_token_false = "<bos_belief> [uncertain] [value_bool] false"
+
+        self.pre_print("bspn", bspn)
+        self.pre_print("bspn_gen", bspn_gen)
+
+        if self.extract(bspn):#uncertainty_token_true in bspn:
+            self.uncertain_rhetorical_question_total += 1
+            self.pre_print("Need Catch")
+            if self.extract(bspn_gen):#uncertainty_token_true in bspn_gen:
+                self.uncertain_rhetorical_question_attempt += 1
+                self.uncertain_rhetorical_question_success += 1
+                self.pre_print("Catch!")
+                return False
+            else:
+                self.pre_print("Not catch")
+                return True
+
+        else:
+            if self.extract(bspn_gen):#uncertainty_token_true in bspn_gen:
+                self.uncertain_rhetorical_question_attempt += 1
+                self.uncertain_rhetorical_question_fault += 1
+                self.pre_print("Fault")
+                return False
+
+    def catch(self, turn):
+
+        """
+        """
+        
+        resp = turn["resp"]
+        resp_gen = turn["resp_gen"]
+        
+        self.pre_print("***** template catcher *****")
+        if not isinstance(resp, str):
+            resp = self.reader.tokenizer.decode(resp)
+        if not isinstance(resp_gen, str):
+            resp_gen = self.reader.tokenizer.decode(resp_gen)
+
+
+        self.pre_print("resp", resp)
+        self.pre_print("resp_gen", resp_gen)
+
+        import re
+        for template in self.template4resp:
+            if re.match(template, resp):
+                self.rhetorical_question_total += 1
+                self.pre_print("Need Catch")
+                self.pre_print(self.reader.tokenizer.decode(turn["user"]))
+
+                for template2 in self.template4resp:
+                    if re.match(template2, resp_gen):
+                        self.rhetorical_question_attempt += 1
+                        self.rhetorical_question_success_tolerate += 1
+                        # return False
+                        if self.get_key_value(template, resp) == self.get_key_value(template2, resp_gen):
+                            self.rhetorical_question_success += 1
+                            self.pre_print("Catch!")
+                            return False
+
+                else:
+                    self.pre_print("Not catch")
+                    self.pre_print(resp_gen)
+                    return True
+
+        for template in self.template4resp:
+            if re.match(template, resp):
+                self.rhetorical_question_attempt += 1
+                self.rhetorical_question_fault += 1
+                
+                self.pre_print("Fault")
+                return False
+
+    def pre_print(self, *value):
+        if int(self.subversion) >= 0:
+            for v in value:
+                print(v)
+        

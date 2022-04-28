@@ -22,9 +22,12 @@
    limitations under the License.
 """
 
+from builtins import print
 import os
 import copy
+import math
 import spacy
+from venv import create
 import random
 import difflib
 from tqdm import tqdm
@@ -35,6 +38,7 @@ from collections import OrderedDict, defaultdict
 import torch
 from torch.nn.utils.rnn import pad_sequence
 from transformers import T5Tokenizer
+from torch.utils.data import Dataset
 
 from utils import definitions
 from utils.io_utils import load_json, load_pickle, save_pickle, get_or_create_logger
@@ -42,11 +46,266 @@ from external_knowledges import MultiWozDB
 
 logger = get_or_create_logger(__name__)
 
+import sys
+import codecs
+sys.stdout = codecs.getwriter("utf-8")(sys.stdout.detach())
+
+
+class SequentialDistributedSampler(torch.utils.data.sampler.Sampler):
+    '''
+    Using for inference with DDP.
+    '''
+    def __init__(self, dataset, batch_size, rank=None, num_replicas=None):
+        if num_replicas is None:
+            if not torch.distributed.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            num_replicas = torch.distributed.get_world_size()
+        if rank is None:
+            if not torch.distributed.is_available():
+                raise RuntimeError("Requires distributed package to be available")
+            rank = torch.distributed.get_rank()
+        
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.batch_size = batch_size
+        self.num_samples = int(math.ceil(len(self.dataset) * 1.0 / self.batch_size / self.num_replicas)) * self.batch_size
+        self.total_size = self.num_samples * self.num_replicas
+
+    def __iter__(self):
+        indices = list(range(len(self.dataset)))
+        indices += [indices[-1]] * (self.total_size - len(indices))
+        indices = indices[self.rank * self.num_samples : (self.rank + 1) * self.num_samples]
+        return iter(indices)
+
+    def __len__(self):
+        return self.num_samples
+
+class MultiWOZDataset(Dataset):
+    def __init__(self, reader, data_type, task, ururu, context_size=-1, num_dialogs=-1, excluded_domains=None):
+        super().__init__()
+        self.reader = reader
+        self.task = task
+        self.ururu = ururu
+        self.context_size = context_size
+        self.dials = self.reader.data[data_type]
+        self.dial_by_domain = load_json("data/MultiWOZ_2.1/dial_by_domain.json")
+
+        if excluded_domains is not None:
+            logger.info("Exclude domains: {}".format(excluded_domains))
+
+            target_dial_ids = []
+            for domains, dial_ids in self.dial_by_domain.items():
+                domain_list = domains.split("-")
+
+                if len(set(domain_list) & set(excluded_domains)) == 0:
+                    target_dial_ids.extend(dial_ids)
+
+            self.dials = [d for d in self.dials if d[0]["dial_id"] in target_dial_ids]
+
+        if num_dialogs > 0:
+            self.dials = random.sample(self.dials, min(num_dialogs, len(self.dials)))
+
+        self.create_turn_batch()
+
+    def create_turn_batch(self):
+        logger.info("Creating turn batches...")
+        self.turn_encoder_input_ids = []
+        self.turn_span_label_ids = []
+        self.turn_belief_label_ids = []
+        self.turn_resp_label_ids = []
+
+        for dial in tqdm(self.dials, desc='Creating turn batches'):
+
+            dial_history = []
+            span_history = []
+
+            for turn in dial:
+                context, span_dict = self.flatten_dial_history(dial_history, span_history, len(turn['user']), self.context_size)
+                encoder_input_ids = context + turn['user'] + [self.reader.eos_token_id]
+
+                # add current span of user utterance
+                for domain, ss_dict in turn['user_span'].items():
+                    for s, span in ss_dict.items():
+                        start_idx = span[0] + len(context)
+                        end_idx = span[1] + len(context)
+                        span_dict[s].append((start_idx, end_idx))
+
+                span_label_tokens = ['O'] * len(encoder_input_ids)
+                for slot, spans in span_dict.items():
+                    for span in spans:
+                        for i in range(span[0], span[1]):
+                            span_label_tokens[i] = slot
+
+                span_label_ids = [self.reader.span_tokens.index(t) for t in span_label_tokens]
+                bspn = turn['bspn']
+                bspn_label = bspn
+                belief_label_ids = bspn_label + [self.reader.eos_token_id]
+
+                resp = turn['dbpn'] + turn['aspn'] + turn['redx']
+                resp_label_ids = resp + [self.reader.eos_token_id]
+
+                self.turn_encoder_input_ids.append(encoder_input_ids)
+                self.turn_span_label_ids.append(span_label_ids)
+                self.turn_belief_label_ids.append(belief_label_ids)
+                self.turn_resp_label_ids.append(resp_label_ids)
+
+                turn_span_info = {}
+                for domain, ss_dict in turn['user_span'].items():
+                    for s, span in ss_dict.items():
+                        if domain not in turn_span_info:
+                            turn_span_info[domain] = {}
+                        
+                        if s not in turn_span_info[domain]:
+                            turn_span_info[domain][s] = []
+                        
+                        turn_span_info[domain][s].append(span)
+                
+                if self.task == 'dst':
+                    for domain, ss_dict in turn['resp_span'].items():
+                        for s, span in ss_dict.items():
+                            if domain not in turn_span_info:
+                                turn_span_info[domain] = {}
+                            
+                            if s not in turn_span_info[domain]:
+                                turn_span_info[domain][s] = []
+
+                            adjustment = len(turn["user"])
+
+                            if not self.ururu:
+                                adjustment += (len(bspn) + len(turn['dbpn']) + len(turn['aspn']))
+
+                            start_idx = span[0] + adjustment
+                            end_idx = span[1] + adjustment
+
+                            turn_span_info[domain][s].append((start_idx, end_idx))
+
+                if self.ururu:
+                    if self.task == 'dst':
+                        turn_text = turn['user'] + turn['resp']
+                    else:
+                        turn_text = turn['user'] + turn['redx']
+                else:
+                    if self.task == 'dst':
+                        turn_text = turn['user'] + bspn + turn['dbpn'] + turn['aspn'] + turn['resp']
+                    else:
+                        turn_text = turn['user'] + bspn + turn['dbpn'] + turn['aspn'] + turn['redx']
+
+                dial_history.append(turn_text)
+                span_history.append(turn_span_info)
+
+    def flatten_dial_history(self, dial_history, span_history, len_postfix, context_size):
+        if context_size > 0:
+            context_size -= 1
+
+        if context_size == 0:
+            windowed_context = []
+            windowed_span_history = []
+        elif context_size > 0:
+            windowed_context = dial_history[-context_size:]
+            windowed_span_history = span_history[-context_size:]
+        else:
+            windowed_context = dial_history
+            windowed_span_history = span_history
+
+        ctx_len = sum([len(c) for c in windowed_context])
+
+        # consider eos_token
+        spare_len = self.reader.max_seq_len - len_postfix - 1
+        while ctx_len >= spare_len:
+            ctx_len -= len(windowed_context[0])
+            windowed_context.pop(0)
+            if len(windowed_span_history) > 0:
+                windowed_span_history.pop(0)
+
+        context_span_info = defaultdict(list)
+        for t, turn_span_info in enumerate(windowed_span_history):
+            for domain, span_info in turn_span_info.items():
+                if isinstance(span_info, dict):
+                    for slot, spans in span_info.items():
+                        adjustment = 0
+
+                        if t > 0:
+                            adjustment += sum([len(c)
+                                            for c in windowed_context[:t]])
+
+                        for span in spans:
+                            start_idx = span[0] + adjustment
+                            end_idx = span[1] + adjustment
+
+                            context_span_info[slot].append((start_idx, end_idx))
+
+                elif isinstance(span_info, list):
+                    slot = domain
+                    spans = span_info
+
+                    adjustment = 0
+                    if t > 0:
+                        adjustment += sum([len(c)
+                                           for c in windowed_context[:t]])
+
+                    for span in spans:
+                        start_idx = span[0] + adjustment
+                        end_idx = span[1] + adjustment
+
+                        context_span_info[slot].append((start_idx, end_idx))
+
+        context = list(chain(*windowed_context))
+
+        return context, context_span_info
+
+    def __len__(self):
+        return len(self.turn_encoder_input_ids)
+
+    def __getitem__(self, index):
+        return self.turn_encoder_input_ids[index], self.turn_span_label_ids[index], self.turn_belief_label_ids[index], self.turn_resp_label_ids[index]
+
+class CollatorPredict(object):
+    def __init__(self):
+        super().__init__()
+
+    def __call__(self, batch):
+        max_turn_num = max([len(item) for item in batch])
+        
+        for item in batch:
+            while len(item) < max_turn_num:
+                item.append({})
+            
+        return batch
+
+class CollatorTrain(object):
+    def __init__(self, pad_token_id, tokenizer):
+        super().__init__()
+        self.pad_token_id = pad_token_id
+        self.tokenizer = tokenizer
+
+    def __call__(self, batch):
+        batch_encoder_input_ids = []
+        batch_span_label_ids = []
+        batch_belief_label_ids = []
+        batch_resp_label_ids = []
+        batch_size = len(batch)
+
+        for i in range(batch_size):
+            encoder_input_ids, span_label_ids, belief_label_ids, resp_label_ids = batch[i]
+            batch_encoder_input_ids.append(torch.tensor(encoder_input_ids, dtype=torch.long))
+            batch_span_label_ids.append(torch.tensor(span_label_ids, dtype=torch.long))
+            batch_belief_label_ids.append(torch.tensor(belief_label_ids, dtype=torch.long))
+            batch_resp_label_ids.append(torch.tensor(resp_label_ids, dtype=torch.long))
+
+        batch_encoder_input_ids = pad_sequence(batch_encoder_input_ids, batch_first=True, padding_value=self.pad_token_id)
+        batch_span_label_ids = pad_sequence(batch_span_label_ids, batch_first=True, padding_value=self.pad_token_id)
+        batch_belief_label_ids = pad_sequence(batch_belief_label_ids, batch_first=True, padding_value=self.pad_token_id)
+        batch_resp_label_ids = pad_sequence(batch_resp_label_ids, batch_first=True, padding_value=self.pad_token_id)
+
+        return batch_encoder_input_ids, batch_span_label_ids, batch_belief_label_ids, batch_resp_label_ids
+        
+        
 
 class BaseIterator(object):
     def __init__(self, reader):
         self.reader = reader
-
+        self.tokenizer = reader.tokenizer
         self.dial_by_domain = load_json("data/MultiWOZ_2.1/dial_by_domain.json")
 
     def bucket_by_turn(self, encoded_data):
@@ -134,7 +393,8 @@ class BaseIterator(object):
 
         return all_batches, num_training_steps, num_dials, num_turns
 
-    def flatten_dial_history(self, dial_history, span_history, len_postfix, context_size):
+    def flatten_dial_history(self, dial_history, span_history, turn_user, context_size):
+        len_postfix = len(turn_user)
         if context_size > 0:
             context_size -= 1
 
@@ -152,8 +412,16 @@ class BaseIterator(object):
 
         # consider eos_token
         spare_len = self.reader.max_seq_len - len_postfix - 1
+
         while ctx_len >= spare_len:
-            ctx_len -= len(windowed_context[0])
+            try:
+                ctx_len -= len(windowed_context[0])
+            except:
+                print(ctx_len, spare_len)
+                print(windowed_context)
+                print(self.reader.max_seq_len, len_postfix)
+                print(self.tokenizer.decode(turn_user))
+                exit()
             windowed_context.pop(0)
             if len(windowed_span_history) > 0:
                 windowed_span_history.pop(0)
@@ -264,8 +532,7 @@ class MultiWOZIterator(BaseIterator):
                 dial_history = []
                 span_history = []
                 for turn in dial:
-                    context, span_dict = self.flatten_dial_history(
-                        dial_history, span_history, len(turn["user"]), context_size)
+                    context, span_dict = self.flatten_dial_history(dial_history, span_history, turn["user"], context_size)#
 
                     encoder_input_ids = context + turn["user"] + [self.reader.eos_token_id]
 
@@ -401,21 +668,25 @@ class MultiWOZIterator(BaseIterator):
 
 
 class BaseReader(object):
-    def __init__(self, backbone):
+    def __init__(self, backbone, subversion):
+
+        self.subversion = subversion
+
         self.nlp = spacy.load("en_core_web_sm")
 
         self.tokenizer = self.init_tokenizer(backbone)
 
         self.data_dir = self.get_data_dir()
 
-        encoded_data_path = os.path.join(self.data_dir, "encoded_data.pkl")
+        encoded_data_path = os.path.join(self.data_dir, "encoded_data_"+self.subversion+".pkl")
 
         if os.path.exists(encoded_data_path):
             logger.info("Load encoded data from {}".format(encoded_data_path))
-
+        
             self.data = load_pickle(encoded_data_path)
-
+        
         else:
+    
             logger.info("Encode data and save to {}".format(encoded_data_path))
             train = self.encode_data("train")
             dev = self.encode_data("dev")
@@ -437,7 +708,7 @@ class BaseReader(object):
         raise NotImplementedError
 
     def init_tokenizer(self, backbone):
-        tokenizer = T5Tokenizer.from_pretrained(backbone)
+        tokenizer = T5Tokenizer.from_pretrained(backbone,)# local_files_only=True)
 
         special_tokens = []
 
@@ -461,6 +732,8 @@ class BaseReader(object):
             special_tokens.append(token)
 
         special_tokens.extend(definitions.SPECIAL_TOKENS)
+
+        special_tokens.append("[uncertain]")
 
         tokenizer.add_special_tokens({"additional_special_tokens": special_tokens})
 
@@ -489,6 +762,7 @@ class BaseReader(object):
     @property
     def max_seq_len(self):
         return self.tokenizer.model_max_length
+        #return 512
 
     @property
     def vocab_size(self):
@@ -498,8 +772,12 @@ class BaseReader(object):
         return self.tokenizer.convert_tokens_to_ids(token)
 
     def encode_text(self, text, bos_token=None, eos_token=None):
+        # print("encode text")
+        # print(text)
+        
         tokens = text.split() if isinstance(text, str) else text
-
+        #print(bos_token, eos_token)
+        #print(self.tokenizer.convert_tokens_to_ids([bos_token]))
         assert isinstance(tokens, list)
 
         if bos_token is not None:
@@ -513,9 +791,10 @@ class BaseReader(object):
                 eos_token = [eos_token]
 
             tokens = tokens + eos_token
-
+        #print(tokens)
         encoded_text = self.tokenizer.encode(" ".join(tokens))
-
+        #print(encoded_text)
+        #print(self.eos_token_id)
         # except eos token
         if encoded_text[-1] == self.eos_token_id:
             encoded_text = encoded_text[:-1]
@@ -527,26 +806,52 @@ class BaseReader(object):
 
 
 class MultiWOZReader(BaseReader):
-    def __init__(self, backbone, version):
+    def __init__(self, backbone, version, subversion, test=True):
+        print("Subversion: ", subversion)
+        self.subversion = subversion
         self.version = version
         self.db = MultiWozDB(os.path.join(os.path.dirname(self.get_data_dir()), "db"))
+        self.test = test
+        super(MultiWOZReader, self).__init__(backbone, subversion)
 
-        super(MultiWOZReader, self).__init__(backbone)
 
     def get_data_dir(self):
         return os.path.join(
             "data", "MultiWOZ_{}".format(self.version), "processed")
 
     def encode_data(self, data_type):
-        data = load_json(os.path.join(self.data_dir, "{}_data.json".format(data_type)))
+        # attack swift
+        #data = load_json(os.path.join(self.data_dir, "{}_attack_data.json".format(data_type)))
 
+        #data = load_json(os.path.join(self.data_dir, "{}_data.json".format(data_type)))
+        
+        if int(self.subversion) >= 0:
+            print("test uncertain mttod")
+            path = os.path.join(self.data_dir, ("{}_paraphrased_data_test_"+self.subversion+".json").format(data_type))
+            
+        else:
+            print("standard raw mttod")
+            path = os.path.join(self.data_dir, "{}_data.json".format(data_type))
+        
+        print(path)
+
+        data = load_json(path)
+    
         encoded_data = []
+        count = 0
         for fn, dial in tqdm(data.items(), desc=data_type, total=len(data)):
+            
             encoded_dial = []
+            
+            #if count == 50:
+            #    break
+            #    exit()
 
+            count += 1
             accum_constraint_dict = {}
             for t in dial["log"]:
                 turn_constrain_dict = self.bspn_to_constraint_dict(t["constraint"])
+                
                 for domain, sv_dict in turn_constrain_dict.items():
                     if domain not in accum_constraint_dict:
                         accum_constraint_dict[domain] = {}
@@ -600,6 +905,8 @@ class MultiWOZReader(BaseReader):
                 '''
 
                 constraint_dict = self.bspn_to_constraint_dict(t["constraint"])
+
+                #print(constraint_dict)
                 ordered_constraint_dict = OrderedDict()
                 for domain, slots in definitions.INFORMABLE_SLOTS.items():
                     if domain not in constraint_dict:
@@ -613,9 +920,9 @@ class MultiWOZReader(BaseReader):
                         value = constraint_dict[domain][slot]
 
                         ordered_constraint_dict[domain][slot] = value
-
+                #print(ordered_constraint_dict)
                 ordered_bspn = self.constraint_dict_to_bspn(ordered_constraint_dict)
-
+                #print(ordered_bspn)
                 bspn_ids = self.encode_text(ordered_bspn,
                                             bos_token=definitions.BOS_BELIEF_TOKEN,
                                             eos_token=definitions.EOS_BELIEF_TOKEN)
@@ -755,7 +1062,7 @@ class MultiWOZReader(BaseReader):
 
     def bspn_to_constraint_dict(self, bspn):
         bspn = bspn.split() if isinstance(bspn, str) else bspn
-
+        #print(bspn)
         constraint_dict = OrderedDict()
         domain, slot = None, None
         for token in bspn:
@@ -767,6 +1074,16 @@ class MultiWOZReader(BaseReader):
 
                 if token in definitions.ALL_DOMAINS:
                     domain = token
+                #elif token in definitions.UNCERTAIN_TOKEN:
+                #    domain = token
+                #    slot = "bool"
+                #    constraint_dict[domain] = OrderedDict()
+                #    constraint_dict[domain][slot] = ["True"]
+                #    continue
+                elif token in definitions.UNCERTAIN_TOKEN:
+                    domain = token
+                    #slot = "bool"
+
 
                 if token.startswith("value_"):
                     if domain is None:
@@ -789,6 +1106,8 @@ class MultiWOZReader(BaseReader):
         for domain, sv_dict in constraint_dict.items():
             for s, value_tokens in sv_dict.items():
                 constraint_dict[domain][s] = " ".join(value_tokens)
+
+        #print(constraint_dict)
 
         return constraint_dict
 
@@ -871,3 +1190,78 @@ class MultiWOZReader(BaseReader):
             return value
         else:
             return matches[0]
+
+
+
+def test_reader(version, refresh, test, subversion):
+
+    if refresh:
+        import os
+        encoded_data_path = os.path.join("./data/MultiWOZ_"+version+"/processed", "encoded_data_"+subversion+".pkl")
+        os.system("rm " + encoded_data_path)
+        print("refresh")
+        #return
+
+    reader = MultiWOZReader("t5-base", version="2.0", subversion=subversion, test=test)
+
+    iterator = MultiWOZIterator(reader)
+
+    #print(reader.tokenizer.get_added_vocab())
+
+    train_batches, num_training_steps_per_epoch, _, _ = iterator.get_batches(
+            "train", 8, 1,)
+
+    train_iterator = iterator.get_data_iterator(
+                train_batches, "e2e", "store_true", False, -1)
+
+    for i, batch in enumerate(train_iterator):
+        #print(batch)
+        print(len(batch))
+        #for ij in batch:
+        #    print(ij)
+
+        #print(batch[1][1])
+        for j in batch[0]:
+            print(reader.tokenizer.decode(j))
+            #break
+
+        for j in batch[1]:
+            print(reader.tokenizer.decode(j[0]))
+            
+            #for e in j:
+            #    print(reader.tokenizer.decode(e[0]))
+        #@exit()
+        #for bs in batch[1][1]:
+        #    print(bs)
+        #    decoded_bs = reader.tokenizer.decode(bs)
+        #    print(decoded_bs.split())
+        #    if "[uncertain]" in decoded_bs.split():
+        #        print(decoded_bs)
+        #        exit()
+            
+        #if i == 50:
+        #    exit()
+
+    return
+
+
+if __name__ == "__main__":
+
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Process some integers.')
+    parser.add_argument('--refresh', action="store_true",
+                        help='an integer for the accumulator')
+    parser.add_argument('--test', type=bool, default=True,
+                    help='sum the integers (default: find the max)')
+
+    parser.add_argument('--version', type=str, default="2.0",
+                    help='sum the integers (default: find the max)')
+
+    parser.add_argument('--subversion', type=str, default="0",
+                    help='sum the integers (default: find the max)')
+
+
+    args = parser.parse_args()
+    print(args)
+    test_reader(args.version, args.refresh, args.test, args.subversion)

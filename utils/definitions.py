@@ -48,13 +48,14 @@ ALL_REQSLOT = ["car", "address", "postcode", "phone", "internet", "parking", "ty
                       "stars", "area", "reference", "time", "leave", "price", "arrive", "id"]
 
 INFORMABLE_SLOTS = {
+    "uncertain":["bool"],
     "taxi": ["leave", "destination", "departure", "arrive"],
     "police": [],
     "hospital": ["department"],
     "hotel": ["type", "parking", "pricerange", "internet", "stay", "day", "people", "area", "stars", "name"],
     "attraction": ["area", "type", "name"],
     "train": ["destination", "day", "arrive", "departure", "people", "leave"],
-    "restaurant": ["food", "pricerange", "area", "name", "time", "day", "people"]
+    "restaurant": ["food", "pricerange", "area", "name", "time", "day", "people"], 
 }
 
 ALL_INFSLOT = ["type", "parking", "pricerange", "internet", "stay", "day", "people", "area", "stars", "name",
@@ -116,4 +117,7 @@ DB_3_TOKEN = "[db_3]"
 
 DB_STATE_TOKENS = [DB_NULL_TOKEN, DB_0_TOKEN, DB_1_TOKEN, DB_2_TOKEN, DB_3_TOKEN]
 
-SPECIAL_TOKENS = USER_TOKENS + BELIEF_TOKENS + DB_TOKENS + ACTION_TOKENS + RESP_TOKENS + DB_STATE_TOKENS
+UNCERTAIN_TOKEN = ["uncertain"]
+
+SPECIAL_TOKENS = USER_TOKENS + BELIEF_TOKENS + DB_TOKENS + ACTION_TOKENS + RESP_TOKENS + DB_STATE_TOKENS + UNCERTAIN_TOKEN
+

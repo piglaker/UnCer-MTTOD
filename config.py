@@ -18,6 +18,7 @@
    limitations under the License.
 """
 
+from email.policy import default
 import os
 import argparse
 
@@ -40,10 +41,13 @@ def add_config(parser):
                        choices=["dst", "e2e"])
     group.add_argument("-add_auxiliary_task", action="store_true")
     group.add_argument("-context_size", type=int, default=-1)
-    group.add_argument("-ururu", action="store_true")
+    group.add_argument("-ururu", default=False)
+    group.add_argument("-subversion", type=str, default="3")
 
     group = parser.add_argument_group("Training")
     group.add_argument("-batch_size", type=int, default=8)
+    group.add_argument("-batch_size_per_gpu", type=int, default=8)
+    group.add_argument("-batch_size_per_gpu_eval", type=int, default=128)
     group.add_argument("-epochs", type=int, default=10)
     group.add_argument("-warmup_steps", type=int, default=-1)
     group.add_argument("-warmup_ratio", type=float, default=0.2)
@@ -74,9 +78,10 @@ def add_config(parser):
     group.add_argument("-use_true_prev_resp", action="store_true")
     group.add_argument("-top_n", type=int, default=5)
     group.add_argument("-output", type=str, default=None)
+    group.add_argument("-skip_when_predict", type=int, default=1)
 
     group = parser.add_argument_group("Misc")
-    group.add_argument("-run_type", type=str, required=True,
+    group.add_argument("-run_type", type=str, default="train",
                        choices=["train", "predict"])
     group.add_argument("-excluded_domains", type=str, nargs="+")
     group.add_argument("-model_dir", type=str, default="checkpoints")
@@ -85,7 +90,10 @@ def add_config(parser):
     group.add_argument("-log_frequency", type=int, default=100)
     group.add_argument("-max_to_keep_ckpt", type=int, default=5)
     group.add_argument("-num_gpus", type=int, default=1)
-
+    group.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
+    group.add_argument("-log_dir", type=str, default='log')
+    group.add_argument("-save_best_model", default=False)
+    
 
 def check_config(parser):
     """ parse arguments and check configuration """
@@ -129,13 +137,13 @@ def check_config(parser):
         raise ValueError(
             "To evaluate dialog state tracking, generated belief state should be used")
 
-    if not os.path.exists(cfg.model_dir):
-        os.makedirs(cfg.model_dir)
-        save_json(vars(cfg), os.path.join(
-            cfg.model_dir, CONFIGURATION_FILE_NAME))
+    if cfg.local_rank in [0, -1]:
+        if not os.path.exists(cfg.model_dir):
+            os.makedirs(cfg.model_dir)
+            save_json(vars(cfg), os.path.join(
+                cfg.model_dir, CONFIGURATION_FILE_NAME))
 
     return cfg
-
 
 def get_config():
     """ return ArgumentParser Instance """
